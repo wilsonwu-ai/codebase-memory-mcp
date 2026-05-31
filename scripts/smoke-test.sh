@@ -176,6 +176,16 @@ if [ "$WD_ROWS" -lt 1 ]; then
 fi
 echo "OK: query_graph WITH DISTINCT returned $WD_ROWS row(s)"
 
+# #241 WHERE label test — f:Function is true for every Function node.
+CYPHER_LBL=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f:Function RETURN f.name\"}")
+LBL_ROWS=$(echo "$CYPHER_LBL" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$LBL_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph WHERE label-test returned 0 rows"
+  echo "$CYPHER_LBL"
+  exit 1
+fi
+echo "OK: query_graph WHERE f:Function returned $LBL_ROWS row(s)"
+
 # 3e: delete_project cleanup
 cli delete_project "{\"project\":\"$PROJECT\"}" > /dev/null
 

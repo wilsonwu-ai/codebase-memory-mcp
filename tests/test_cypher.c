@@ -770,6 +770,38 @@ TEST(cypher_exec_with_distinct_issue238) {
     PASS();
 }
 
+/* issue #241: label tests in WHERE clauses (openCypher `WHERE n:Label`) —
+ * previously a parse error. */
+TEST(cypher_exec_where_label_test_issue241) {
+    cbm_store_t *s = setup_cypher_store();
+
+    /* f:Function is true for all 4 Function nodes. */
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s, "MATCH (f:Function) WHERE f:Function RETURN f.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    /* f:Class matches none of the functions. */
+    cbm_cypher_result_t r2 = {0};
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE f:Class RETURN f.name", "test", 0, &r2);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r2.row_count, 0);
+    cbm_cypher_result_free(&r2);
+
+    /* Negated label test: NOT f:Class is always true. */
+    cbm_cypher_result_t r3 = {0};
+    rc =
+        cbm_cypher_execute(s, "MATCH (f:Function) WHERE NOT f:Class RETURN f.name", "test", 0, &r3);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r3.row_count, 4);
+    cbm_cypher_result_free(&r3);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* --- Ported from cypher_test.go: TestExecuteInlinePropertyFilter --- */
 TEST(cypher_exec_inline_props) {
     cbm_store_t *s = setup_cypher_store();
@@ -2242,6 +2274,7 @@ SUITE(cypher) {
     /* Go test ports */
     RUN_TEST(cypher_exec_distinct);
     RUN_TEST(cypher_exec_with_distinct_issue238);
+    RUN_TEST(cypher_exec_where_label_test_issue241);
     RUN_TEST(cypher_exec_inline_props);
     RUN_TEST(cypher_parse_where_starts_with);
     RUN_TEST(cypher_parse_where_contains);

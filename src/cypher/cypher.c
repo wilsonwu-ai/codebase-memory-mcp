@@ -940,6 +940,20 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
     cbm_condition_t c = {0};
     c.negated = negated;
 
+    /* Label test: WHERE n:Label (openCypher, #241). Modelled as a leaf with
+     * op="HAS_LABEL" and value=Label, evaluated against the bound node's label. */
+    if (check(p, TOK_COLON)) {
+        advance(p);
+        const cbm_token_t *lbl = expect(p, TOK_IDENT);
+        if (!lbl) {
+            return NULL;
+        }
+        c.variable = heap_strdup(var->text);
+        c.op = heap_strdup("HAS_LABEL");
+        c.value = heap_strdup(lbl->text);
+        return expr_leaf(c);
+    }
+
     if (match(p, TOK_DOT)) {
         const cbm_token_t *prop = expect(p, TOK_IDENT);
         if (!prop) {
@@ -2061,6 +2075,14 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
 
 /* Evaluate a WHERE condition against a binding */
 static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
+    /* Label test: WHERE n:Label (#241) — compare the bound node's label
+     * directly rather than a property value. */
+    if (strcmp(c->op, "HAS_LABEL") == 0) {
+        cbm_node_t *n = binding_get(b, c->variable);
+        bool result = n && n->label && c->value && strcmp(n->label, c->value) == 0;
+        return c->negated ? !result : result;
+    }
+
     const char *actual = resolve_condition_value(c, b);
     if (!actual) {
         return true;
