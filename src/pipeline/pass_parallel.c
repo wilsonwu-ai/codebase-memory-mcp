@@ -18,6 +18,9 @@ enum {
     PP_JSON_MARGIN = 10,
     PP_ESC_MARGIN = 3,
     PP_ESC_SPACE = 2,
+    /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
+     * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
+    PP_JSON_FIELD_OVERHEAD = 6,
     PP_ARGS_MARGIN = 20,
     PP_LOG_THRESH = 24,
     PP_LOG_INTERVAL = 10,
@@ -153,13 +156,41 @@ static int json_escape_char(char *buf, size_t avail, char ch) {
     return PP_ESC_SPACE;
 }
 
+/* Escaped length of a string under json_escape_char's rules: escaped
+ * characters expand to 2 bytes, everything else stays 1. */
+static size_t pp_json_escaped_len(const char *s) {
+    size_t n = 0;
+    for (; *s; s++) {
+        switch (*s) {
+        case '"':
+        case '\\':
+        case '\n':
+        case '\r':
+        case '\t':
+            n += PP_ESC_SPACE;
+            break;
+        default:
+            n += SKIP_ONE;
+        }
+    }
+    return n;
+}
+
+/* Appends are ATOMIC: a field is emitted only if the WHOLE serialized form
+ * fits (with PP_ESC_SPACE bytes reserved for the closing '}' + NUL). Cutting a
+ * field mid-value produced unterminated strings/arrays — malformed properties
+ * JSON that aborts every json_extract()-based consumer downstream (seen on the
+ * Linux kernel: 50-param functions truncated at the 2 KB cap). Dropping an
+ * oversized optional field whole keeps the JSON valid. Twin of
+ * pass_definitions.c — keep both in sync. */
 static void append_json_string(char *buf, size_t bufsize, size_t *pos, const char *key,
                                const char *val) {
     if (!val || val[0] == '\0') {
         return;
     }
-    if (*pos >= bufsize - PP_JSON_MARGIN) {
-        return;
+    size_t required = strlen(key) + pp_json_escaped_len(val) + PP_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
     }
     size_t p = *pos;
     int w = snprintf(buf + p, bufsize - p, ",\"%s\":\"", key);
@@ -178,11 +209,20 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
     *pos = p;
 }
 
-/* Append a JSON array of strings: ,"key":["a","b","c"] */
+/* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
+ * append_json_string: emitted only if the whole array fits. */
 static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
                                   const char **arr) {
     if (!arr || !arr[0] || *pos >= bufsize - PP_JSON_MARGIN) {
         return;
+    }
+    /* ,"key":[ + per item "<escaped>" + separating commas + ] */
+    size_t required = strlen(key) + PP_JSON_FIELD_OVERHEAD;
+    for (int i = 0; arr[i]; i++) {
+        required += pp_json_escaped_len(arr[i]) + PP_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+    }
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return; /* whole array would not fit — skip it atomically */
     }
     size_t p = *pos;
     int n = snprintf(buf + p, bufsize - p, ",\"%s\":[", key);

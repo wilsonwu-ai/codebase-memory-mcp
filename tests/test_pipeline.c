@@ -485,23 +485,26 @@ TEST(pipeline_def_props_valid_json_when_oversized) {
      * buffer margin as the param_types array starts — the array is then cut
      * mid-item (`"param_types":["enum`), exactly the kernel failure shape.
      * Sweeping 10..69 params deterministically hits the window (pre-fix:
-     * sweep_fn_30 -> 2047-byte malformed properties). */
-    char path[512];
-    snprintf(path, sizeof(path), "%s/huge.c", g_tmpdir);
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        teardown_test_repo();
-        FAIL("failed to write huge.c");
-    }
+     * sweep_fn_30 -> 2047-byte malformed properties). ONE FUNCTION PER FILE so
+     * the file count exceeds MIN_FILES_FOR_PARALLEL (50) and the test covers
+     * the PARALLEL pipeline's duplicated props builder (pass_parallel.c) — the
+     * path large repos take; the serial twin lives in pass_definitions.c. */
     for (int n = 10; n < 70; n++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/sweep_%02d.c", g_tmpdir, n);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            teardown_test_repo();
+            FAIL("failed to write sweep file");
+        }
         fprintf(f, "int sweep_fn_%02d(", n);
         for (int i = 0; i < n; i++) {
             fprintf(f, "%sstruct long_struct_type_name_padding_padding_%02d *par_%02d",
                     i ? ", " : "", i, i);
         }
         fprintf(f, ") { return 0; }\n");
+        fclose(f);
     }
-    fclose(f);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test_huge_props.db", g_tmpdir);
