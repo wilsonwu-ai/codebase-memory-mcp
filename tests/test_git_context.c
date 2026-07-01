@@ -34,6 +34,10 @@
 #include <limits.h>
 #endif
 
+/* These helpers shell out to git and are only used by the non-Windows test
+ * bodies below; on Windows every test SKIP_PLATFORMs, so guard them here too or
+ * they'd be unused-static functions and fail the -Werror build. */
+#ifndef _WIN32
 /* Run a git command inside dir, return 0 on success. */
 static int git_run(const char *dir, const char *args) {
     char cmd[1024];
@@ -55,6 +59,7 @@ static int make_git_repo(const char *dir) {
     if (git_run(dir, "commit -q -m init") != 0) return -1;
     return 0;
 }
+#endif /* _WIN32 */
 
 /* ── canonical_root: normal repo indexed from its root ──────────── */
 
