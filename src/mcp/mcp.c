@@ -354,7 +354,9 @@ static const tool_def_t TOOLS[] = {
      "vector cosine search that bridges vocabulary (finds 'publish' when you search 'send'). "
      "The three modes are independent and can be combined in a single call. "
      "RESPONSE: compact TOON tables by default — `results[N]{qn,label,file,lines,in,out}:` "
-     "header then one row per hit (in/out = edge degrees). Add per-node property columns via "
+     "header then one row per hit. in/out = TOTAL degree across ALL edge types (DEFINES, "
+     "USAGE, CALLS, ...), NOT caller/callee counts — use trace_path for callers. Add per-node "
+     "property columns via "
      "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); pass format=\"json\" for "
      "legacy verbose objects (include_connected always uses JSON). "
      "PAGINATION: results are capped at limit (default 50). The response always includes "
@@ -430,7 +432,10 @@ static const tool_def_t TOOLS[] = {
     {"trace_path", "Trace path",
      "Trace paths through the code graph. Modes: calls (callers/callees), data_flow (value "
      "propagation with args at each hop), cross_service (through HTTP/async Route nodes). "
-     "Use INSTEAD OF grep for callers, dependencies, impact analysis, or data flow tracing.",
+     "Use INSTEAD OF grep for callers, dependencies, impact analysis, or data flow tracing. "
+     "RESPONSE: compact TOON tables — `callees[N]{qn,hop}:`/`callers[N]{qn,hop}:` headers then "
+     "one row per reached node (hop = BFS distance); risk/test/args columns appear when the "
+     "matching flags are set. Pass format=\"json\" for legacy verbose objects.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"mode\":{"
@@ -445,8 +450,11 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Add risk classification (CRITICAL/HIGH/MEDIUM/LOW) based on hop distance"
      "\"},\"include_tests\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Include test files in results. When false (default), test files are "
-     "filtered out. When true, test nodes are included with is_test=true marker."
-     "\"}},\"required\":[\"function_name\",\"project\"]}"},
+     "filtered out. When true, test nodes are included with a test column/marker.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"description\":\"Response encoding. toon (default): compact header+rows tables. "
+     "json: legacy verbose per-hop objects.\"}},"
+     "\"required\":[\"function_name\",\"project\"]}"},
 
     {"get_code_snippet", "Get code snippet",
      "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
@@ -466,12 +474,14 @@ static const tool_def_t TOOLS[] = {
      "\"project\"]}"},
 
     {"get_architecture", "Get architecture",
-     "Get high-level architecture overview — packages, services, dependencies, and project "
-     "structure at a glance. Includes 'clusters': Leiden community detection over the call/import "
-     "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
-     "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
-     "the real architectural seams, which often cut across the folder layout. Optional path scopes "
-     "analysis to nodes under that directory prefix (file_path).",
+     "Get high-level architecture overview. DEFAULT (no aspects) is a compact summary — "
+     "overview counts, languages, packages, entry_points; request more via aspects:[...] "
+     "(structure, dependencies, routes, hotspots, boundaries, layers, clusters, file_tree) or "
+     "[\"all\"]. 'clusters' runs Leiden community detection over the call/import graph, "
+     "surfacing the de-facto modules (label, member count, cohesion score, representative "
+     "top_nodes, binding packages/edge_types) — the real architectural seams, which often cut "
+     "across the folder layout. Optional path scopes analysis to nodes under that directory "
+     "prefix (file_path).",
      /* The aspects enum mirrors VALID_ASPECTS (see aspect_is_valid) — update both together. */
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
      "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. "
@@ -486,7 +496,9 @@ static const tool_def_t TOOLS[] = {
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
      "importance (definitions first, popular functions next, tests last). "
-     "Modes: compact (default, signatures only — token efficient), full (with source), "
+     "Modes: compact (default, signatures only — token efficient), full (source capped at a "
+     "60-line window around the first match per hit; source_truncated marks the cut — use "
+     "get_code_snippet for the complete symbol), "
      "files (just file paths). Use path_filter regex to scope results. "
      "TRUNCATION: enriched results are capped at limit (default 10). Response carries "
      "'total_grep_matches' (raw grep hit count) and 'total_results' (deduplicated function "
@@ -1412,7 +1424,18 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
-    add_git_context_json(doc, p, root_path_buf[0] ? root_path_buf : NULL);
+    /* Listing stays lean: only the branch (the one git fact that
+     * disambiguates same-repo projects). The 12-field git block — mostly
+     * null for non-git roots — cost ~10KB across a full cache and is one
+     * index_status call away for the project you actually care about. */
+    if (root_path_buf[0]) {
+        cbm_git_context_t gctx = {0};
+        (void)cbm_git_context_resolve(root_path_buf, &gctx);
+        if (gctx.is_git && gctx.branch) {
+            yyjson_mut_obj_add_strcpy(doc, p, "branch", gctx.branch);
+        }
+        cbm_git_context_free(&gctx);
+    }
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
     yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
@@ -2451,43 +2474,71 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
+    /* Response encoding: TOON table by default (the columns double as the
+     * table header); format:"json" restores the legacy columns/rows arrays. */
+    char *qg_format = cbm_mcp_get_string_arg(args, "format");
+    bool qg_legacy_json = qg_format && strcmp(qg_format, "json") == 0;
+    free(qg_format);
 
-    /* columns */
-    yyjson_mut_val *cols = yyjson_mut_arr(doc);
-    for (int i = 0; i < result.col_count; i++) {
-        yyjson_mut_arr_add_str(doc, cols, result.columns[i]);
-    }
-    yyjson_mut_obj_add_val(doc, root, "columns", cols);
-
-    /* rows */
-    yyjson_mut_val *rows = yyjson_mut_arr(doc);
-    for (int r = 0; r < result.row_count; r++) {
-        yyjson_mut_val *row = yyjson_mut_arr(doc);
-        for (int c = 0; c < result.col_count; c++) {
-            yyjson_mut_arr_add_str(doc, row, result.rows[r][c]);
+    char *json = NULL;
+    if (!qg_legacy_json) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_toon_table_header(&sb, "rows", result.row_count, (const char *const *)result.columns,
+                              result.col_count);
+        for (int r = 0; r < result.row_count; r++) {
+            cbm_toon_row_begin(&sb);
+            for (int c = 0; c < result.col_count; c++) {
+                cbm_toon_cell_str(&sb, result.rows[r][c], c == 0);
+            }
+            cbm_toon_row_end(&sb);
         }
-        yyjson_mut_arr_add_val(rows, row);
-    }
-    yyjson_mut_obj_add_val(doc, root, "rows", rows);
-    yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        cbm_toon_scalar_int(&sb, "total", result.row_count);
+        if (result.row_count == 0) {
+            cbm_toon_scalar_str(&sb, "hint",
+                                "Query returned no results. Use get_graph_schema() to see "
+                                "available labels and edge types.");
+        }
+        json = cbm_sb_finish(&sb);
+    } else {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
 
-    if (result.row_count == 0) {
-        yyjson_mut_obj_add_str(
-            doc, root, "hint",
-            "Query returned no results. Use get_graph_schema() to see available labels and "
-            "edge types.");
-    }
+        /* columns */
+        yyjson_mut_val *cols = yyjson_mut_arr(doc);
+        for (int i = 0; i < result.col_count; i++) {
+            yyjson_mut_arr_add_str(doc, cols, result.columns[i]);
+        }
+        yyjson_mut_obj_add_val(doc, root, "columns", cols);
 
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
+        /* rows */
+        yyjson_mut_val *rows = yyjson_mut_arr(doc);
+        for (int r = 0; r < result.row_count; r++) {
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            for (int c = 0; c < result.col_count; c++) {
+                yyjson_mut_arr_add_str(doc, row, result.rows[r][c]);
+            }
+            yyjson_mut_arr_add_val(rows, row);
+        }
+        yyjson_mut_obj_add_val(doc, root, "rows", rows);
+        yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+
+        if (result.row_count == 0) {
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "Query returned no results. Use get_graph_schema() to see available labels and "
+                "edge types.");
+        }
+
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
     cbm_cypher_result_free(&result);
     free(query);
     free(project);
 
-    char *res = cbm_mcp_text_result(json, false);
+    char *res = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
     free(json);
     return res;
 }
@@ -2783,6 +2834,21 @@ static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
 }
 
+/* Join a string list into buf with ';' separators (keeps TOON cells
+ * comma-free so they need no quoting). Truncates silently at sz. */
+static void arch_join_list(char *buf, size_t sz, const char **items, int n) {
+    size_t pos = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        const char *s = items[i] ? items[i] : "";
+        int w = snprintf(buf + pos, sz - pos, "%s%s", i > 0 ? ";" : "", s);
+        if (w < 0 || (size_t)w >= sz - pos) {
+            break;
+        }
+        pos += (size_t)w;
+    }
+}
+
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *scope_path = cbm_mcp_get_string_arg(args, "path");
@@ -2857,6 +2923,20 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* Default (no aspects) = compact summary. The old default rendered ALL
+     * aspects including the full file_tree — ~94KB (~23K tokens) on a
+     * mid-size repo, a context bomb for the LLM consumers. Explicit
+     * aspects (or ["all"]) keep full access to every section. */
+    bool default_summary = false;
+    if (aspects_strs_count == 0) {
+        /* NOT "overview" — that means everything-except-file_tree. Totals and
+         * node_labels/edge_types counts are always emitted alongside. */
+        aspects_strs[aspects_strs_count++] = "languages";
+        aspects_strs[aspects_strs_count++] = "packages";
+        aspects_strs[aspects_strs_count++] = "entry_points";
+        default_summary = true;
+    }
+
     cbm_schema_info_t schema = {0};
     /* Counts-only: this handler renders label/type counts but never property
      * keys, and full key discovery json_each-scans every row (seconds-to-
@@ -2864,14 +2944,222 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_get_schema_counts_scoped(store, project, scope_path, &schema);
 
     cbm_architecture_info_t arch = {0};
-    cbm_store_get_architecture(store, project, scope_path,
-                               aspects_strs_count > 0 ? aspects_strs : NULL, aspects_strs_count,
-                               &arch);
+    cbm_store_get_architecture(store, project, scope_path, aspects_strs, aspects_strs_count, &arch);
 
     int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
     int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
     char norm_path[CBM_SZ_512];
     bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
+
+    /* Response encoding: TOON tables by default; format:"json" restores the
+     * legacy per-item objects. */
+    char *arch_format = cbm_mcp_get_string_arg(args, "format");
+    bool arch_legacy_json = arch_format && strcmp(arch_format, "json") == 0;
+    free(arch_format);
+
+    if (!arch_legacy_json) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        if (project) {
+            cbm_toon_scalar_str(&sb, "project", project);
+        }
+        if (default_summary) {
+            cbm_toon_scalar_str(&sb, "aspects_hint",
+                                "Summary view (default). More on request via aspects:[...] — "
+                                "structure, dependencies, routes, hotspots, boundaries, layers, "
+                                "clusters, file_tree — or [\"all\"] for everything.");
+        }
+        if (path_scoped) {
+            cbm_toon_scalar_str(&sb, "path", norm_path);
+            cbm_toon_scalar_int(&sb, "root_total_nodes", cbm_store_count_nodes(store, project));
+            cbm_toon_scalar_int(&sb, "root_total_edges", cbm_store_count_edges(store, project));
+            cbm_toon_scalar_int(&sb, "scoped_total_nodes", node_count);
+            cbm_toon_scalar_int(&sb, "scoped_total_edges", edge_count);
+        }
+        cbm_toon_scalar_int(&sb, "total_nodes", node_count);
+        cbm_toon_scalar_int(&sb, "total_edges", edge_count);
+
+        if (aspect_wanted(aspects_doc, aspects_arr, "structure") && schema.node_label_count > 0) {
+            static const char *const lcols[] = {"label", "count"};
+            cbm_toon_table_header(&sb, "node_labels", schema.node_label_count, lcols, 2);
+            for (int i = 0; i < schema.node_label_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, schema.node_labels[i].label, true);
+                cbm_toon_cell_int(&sb, schema.node_labels[i].count, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (aspect_wanted(aspects_doc, aspects_arr, "dependencies") && schema.edge_type_count > 0) {
+            static const char *const tcols[] = {"type", "count"};
+            cbm_toon_table_header(&sb, "edge_types", schema.edge_type_count, tcols, 2);
+            for (int i = 0; i < schema.edge_type_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, schema.edge_types[i].type, true);
+                cbm_toon_cell_int(&sb, schema.edge_types[i].count, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (aspect_wanted(aspects_doc, aspects_arr, "routes") && schema.rel_pattern_count > 0) {
+            static const char *const pcols[] = {"pattern"};
+            cbm_toon_table_header(&sb, "relationship_patterns", schema.rel_pattern_count, pcols, 1);
+            for (int i = 0; i < schema.rel_pattern_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, schema.rel_patterns[i], true);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.language_count > 0) {
+            static const char *const gcols[] = {"language", "files"};
+            cbm_toon_table_header(&sb, "languages", arch.language_count, gcols, 2);
+            for (int i = 0; i < arch.language_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.languages[i].language, true);
+                cbm_toon_cell_int(&sb, arch.languages[i].file_count, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.package_count > 0) {
+            static const char *const kcols[] = {"name", "nodes", "fan_in", "fan_out"};
+            cbm_toon_table_header(&sb, "packages", arch.package_count, kcols, 4);
+            for (int i = 0; i < arch.package_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.packages[i].name, true);
+                cbm_toon_cell_int(&sb, arch.packages[i].node_count, false);
+                cbm_toon_cell_int(&sb, arch.packages[i].fan_in, false);
+                cbm_toon_cell_int(&sb, arch.packages[i].fan_out, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.entry_point_count > 0) {
+            /* qn only — `name` is its last segment. */
+            static const char *const ecols[] = {"qn", "file"};
+            cbm_toon_table_header(&sb, "entry_points", arch.entry_point_count, ecols, 2);
+            for (int i = 0; i < arch.entry_point_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.entry_points[i].qualified_name, true);
+                cbm_toon_cell_str(&sb, arch.entry_points[i].file, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.route_count > 0) {
+            static const char *const rcols[] = {"method", "path", "handler"};
+            cbm_toon_table_header(&sb, "routes", arch.route_count, rcols, 3);
+            for (int i = 0; i < arch.route_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.routes[i].method, true);
+                cbm_toon_cell_str(&sb, arch.routes[i].path, false);
+                cbm_toon_cell_str(&sb, arch.routes[i].handler, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.hotspot_count > 0) {
+            static const char *const hcols[] = {"qn", "fan_in"};
+            cbm_toon_table_header(&sb, "hotspots", arch.hotspot_count, hcols, 2);
+            for (int i = 0; i < arch.hotspot_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.hotspots[i].qualified_name, true);
+                cbm_toon_cell_int(&sb, arch.hotspots[i].fan_in, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.boundary_count > 0) {
+            static const char *const bcols[] = {"from", "to", "calls"};
+            cbm_toon_table_header(&sb, "boundaries", arch.boundary_count, bcols, 3);
+            for (int i = 0; i < arch.boundary_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.boundaries[i].from, true);
+                cbm_toon_cell_str(&sb, arch.boundaries[i].to, false);
+                cbm_toon_cell_int(&sb, arch.boundaries[i].call_count, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.service_count > 0) {
+            static const char *const scols[] = {"from", "to", "type", "count"};
+            cbm_toon_table_header(&sb, "services", arch.service_count, scols, 4);
+            for (int i = 0; i < arch.service_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.services[i].from, true);
+                cbm_toon_cell_str(&sb, arch.services[i].to, false);
+                cbm_toon_cell_str(&sb, arch.services[i].type, false);
+                cbm_toon_cell_int(&sb, arch.services[i].count, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.layer_count > 0) {
+            static const char *const ycols[] = {"name", "layer", "reason"};
+            cbm_toon_table_header(&sb, "layers", arch.layer_count, ycols, 3);
+            for (int i = 0; i < arch.layer_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.layers[i].name, true);
+                cbm_toon_cell_str(&sb, arch.layers[i].layer, false);
+                cbm_toon_cell_str(&sb, arch.layers[i].reason, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.cluster_count > 0) {
+            /* Nested lists become ';'-joined cells. */
+            static const char *const ccols[] = {"id",        "label",    "members",   "cohesion",
+                                                "top_nodes", "packages", "edge_types"};
+            cbm_toon_table_header(&sb, "clusters", arch.cluster_count, ccols, 7);
+            for (int i = 0; i < arch.cluster_count; i++) {
+                const cbm_cluster_info_t *c = &arch.clusters[i];
+                char joined[CBM_SZ_1K];
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_int(&sb, c->id, true);
+                cbm_toon_cell_str(&sb, c->label, false);
+                cbm_toon_cell_int(&sb, c->members, false);
+                cbm_toon_cell_real(&sb, c->cohesion, false);
+                arch_join_list(joined, sizeof(joined), c->top_nodes, c->top_node_count);
+                cbm_toon_cell_str(&sb, joined, false);
+                arch_join_list(joined, sizeof(joined), c->packages, c->package_count);
+                cbm_toon_cell_str(&sb, joined, false);
+                arch_join_list(joined, sizeof(joined), c->edge_types, c->edge_type_count);
+                cbm_toon_cell_str(&sb, joined, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        if (arch.file_tree_count > 0) {
+            static const char *const fcols[] = {"path", "type", "children"};
+            cbm_toon_table_header(&sb, "file_tree", arch.file_tree_count, fcols, 3);
+            for (int i = 0; i < arch.file_tree_count; i++) {
+                cbm_toon_row_begin(&sb);
+                cbm_toon_cell_str(&sb, arch.file_tree[i].path, true);
+                cbm_toon_cell_str(&sb, arch.file_tree[i].type, false);
+                cbm_toon_cell_int(&sb, arch.file_tree[i].children, false);
+                cbm_toon_row_end(&sb);
+            }
+        }
+        /* Cross-repo edge summary (mirrors append_cross_repo_summary). */
+        {
+            static const char *const cross_types[] = {"CROSS_HTTP_CALLS",    "CROSS_ASYNC_CALLS",
+                                                      "CROSS_CHANNEL",       "CROSS_GRPC_CALLS",
+                                                      "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS"};
+            int cross_total = 0;
+            for (int t = 0; t < (int)(sizeof(cross_types) / sizeof(cross_types[0])); t++) {
+                for (int i = 0; i < schema.edge_type_count; i++) {
+                    if (strcmp(schema.edge_types[i].type, cross_types[t]) == 0) {
+                        cross_total += schema.edge_types[i].count;
+                        break;
+                    }
+                }
+            }
+            if (cross_total > 0) {
+                cbm_toon_scalar_int(&sb, "cross_repo_links_total", cross_total);
+            }
+        }
+
+        cbm_store_architecture_free(&arch);
+        cbm_store_schema_free(&schema);
+        if (aspects_doc) {
+            yyjson_doc_free(aspects_doc);
+        }
+        free(project);
+        free(scope_path);
+        char *text = cbm_sb_finish(&sb);
+        char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
+        free(text);
+        return result;
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -2879,6 +3167,12 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     if (project) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
+    }
+    if (default_summary) {
+        yyjson_mut_obj_add_str(doc, root, "aspects_hint",
+                               "Summary view (default). More on request via aspects:[...] — "
+                               "structure, dependencies, routes, hotspots, boundaries, layers, "
+                               "clusters, file_tree — or [\"all\"] for everything.");
     }
     if (path_scoped) {
         yyjson_mut_obj_add_str(doc, root, "path", norm_path);
@@ -3257,6 +3551,61 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
     return arr;
 }
 
+/* TOON table for one trace direction: callees[N]{qn,hop,...} with optional
+ * risk / test / args columns. `name` is omitted (it is the qn's last
+ * segment); the per-item JSON key envelope was 84% of the legacy payload. */
+static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
+                              bool risk_labels, bool include_tests, bool data_flow) {
+    int visible = 0;
+    for (int i = 0; i < tr->visited_count; i++) {
+        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+            continue;
+        }
+        visible++;
+    }
+    const char *cols[5] = {"qn", "hop"};
+    int ncols = 2;
+    if (risk_labels) {
+        cols[ncols++] = "risk";
+    }
+    if (include_tests) {
+        cols[ncols++] = "test";
+    }
+    if (data_flow) {
+        cols[ncols++] = "args";
+    }
+    cbm_toon_table_header(sb, key, visible, cols, ncols);
+    for (int i = 0; i < tr->visited_count; i++) {
+        const char *fp = tr->visited[i].node.file_path;
+        bool test = is_test_file(fp);
+        if (!include_tests && test) {
+            continue;
+        }
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, tr->visited[i].node.qualified_name, true);
+        cbm_toon_cell_int(sb, tr->visited[i].hop, false);
+        if (risk_labels) {
+            cbm_toon_cell_str(sb, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)), false);
+        }
+        if (include_tests) {
+            cbm_toon_cell_bool(sb, test, false);
+        }
+        if (data_flow) {
+            size_t alen = 0;
+            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
+            if (ea && alen > 0 && alen < CBM_SZ_1K) {
+                char abuf[CBM_SZ_1K];
+                memcpy(abuf, ea, alen);
+                abuf[alen] = '\0';
+                cbm_toon_cell_str(sb, abuf, false);
+            } else {
+                cbm_toon_cell_str(sb, "", false);
+            }
+        }
+        cbm_toon_row_end(sb);
+    }
+}
+
 static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count);
 
 /* Rank a candidate for name resolution. The label tier (callable > class-like >
@@ -3511,15 +3860,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-
-    yyjson_mut_obj_add_str(doc, root, "function", func_name);
-    yyjson_mut_obj_add_str(doc, root, "direction", direction);
-    if (mode) {
-        yyjson_mut_obj_add_str(doc, root, "mode", mode);
-    }
+    /* Response encoding: TOON tables by default; format:"json" restores the
+     * legacy verbose per-hop objects. */
+    char *trace_format = cbm_mcp_get_string_arg(args, "format");
+    bool trace_legacy_json = trace_format && strcmp(trace_format, "json") == 0;
+    free(trace_format);
 
     /* Edge types: explicit > mode-based > default */
     const char *edge_types[MCP_COL_16];
@@ -3527,8 +3872,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_doc *et_doc_keep = resolve_trace_edge_types(args, mode, edge_types, &edge_type_count);
 
     /* Run BFS for each requested direction.
-     * IMPORTANT: yyjson_mut_obj_add_str borrows pointers — we must keep
-     * traversal results alive until after yy_doc_to_str serialization. */
+     * IMPORTANT: emitters borrow node-string pointers — traversal results
+     * must stay alive until after serialization. */
     bool do_outbound = strcmp(direction, "outbound") == 0 || strcmp(direction, "both") == 0;
     bool do_inbound = strcmp(direction, "inbound") == 0 || strcmp(direction, "both") == 0;
 
@@ -3542,22 +3887,52 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (do_outbound) {
         bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
                             depth, &tr_out);
-        yyjson_mut_obj_add_val(
-            doc, root, "callees",
-            bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
     }
-
     if (do_inbound) {
         bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
                             &tr_in);
-        yyjson_mut_obj_add_val(
-            doc, root, "callers",
-            bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
     }
 
-    /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
+    char *json = NULL;
+    if (!trace_legacy_json) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_toon_scalar_str(&sb, "function", func_name);
+        cbm_toon_scalar_str(&sb, "direction", direction);
+        if (mode) {
+            cbm_toon_scalar_str(&sb, "mode", mode);
+        }
+        if (do_outbound) {
+            bfs_to_toon_table(&sb, "callees", &tr_out, risk_labels, include_tests, data_flow);
+        }
+        if (do_inbound) {
+            bfs_to_toon_table(&sb, "callers", &tr_in, risk_labels, include_tests, data_flow);
+        }
+        json = cbm_sb_finish(&sb);
+    } else {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        yyjson_mut_obj_add_str(doc, root, "function", func_name);
+        yyjson_mut_obj_add_str(doc, root, "direction", direction);
+        if (mode) {
+            yyjson_mut_obj_add_str(doc, root, "mode", mode);
+        }
+        if (do_outbound) {
+            yyjson_mut_obj_add_val(
+                doc, root, "callees",
+                bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
+        }
+        if (do_inbound) {
+            yyjson_mut_obj_add_val(
+                doc, root, "callers",
+                bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
+        }
+        /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
 
     /* Now safe to free traversal data */
     if (do_outbound) {
@@ -4888,8 +5263,11 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         yyjson_mut_obj_add_str(doc, root_obj, "match_method", match_method);
     }
 
-    /* Enrich with node properties (freed AFTER serialization — zero-copy). */
-    yyjson_doc *props_doc = enrich_node_properties(doc, root_obj, node->properties_json);
+    /* No property-blob enrichment: the verbatim source IS the payload here —
+     * signature/docstring are literally in it, and the similarity internals
+     * (fp/sp/bt) plus metric fields were 41% of the response for zero agent
+     * value. Metrics stay reachable via search_graph fields=[...]. */
+    yyjson_doc *props_doc = NULL;
 
     /* Caller/callee counts — store already resolved by calling handler */
     cbm_store_t *store = srv->store;
@@ -5230,11 +5608,33 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
     }
 
     if (mode == MODE_FULL) {
-        char *source = read_file_lines(abs_path, r->start_line, r->end_line);
+        /* Cap each hit's source at a match-anchored window: uncapped
+         * whole-symbol dumps ran to 5.7KB × N hits (142KB responses). The
+         * complete symbol stays one get_code_snippet call away;
+         * source_start/source_truncated make the cut explicit. */
+        enum { SC_FULL_MAX_LINES = 60, SC_FULL_LEAD = 5 };
+        int s = r->start_line;
+        int e = r->end_line;
+        bool truncated = false;
+        if (e - s + 1 > SC_FULL_MAX_LINES) {
+            if (r->match_count > 0 && r->match_lines[0] - SC_FULL_LEAD > s) {
+                s = r->match_lines[0] - SC_FULL_LEAD;
+            }
+            e = s + SC_FULL_MAX_LINES - 1;
+            if (e > r->end_line) {
+                e = r->end_line;
+            }
+            truncated = true;
+        }
+        char *source = read_file_lines(abs_path, s, e);
         if (source) {
             sanitize_ascii(source);
             yyjson_mut_obj_add_strcpy(doc, item, "source", source);
             free(source);
+            if (truncated) {
+                yyjson_mut_obj_add_int(doc, item, "source_start", s);
+                yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
+            }
         }
     } else if (context_lines > 0 && r->match_count > 0) {
         int ctx_start = r->match_lines[0] - context_lines;
@@ -5253,11 +5653,10 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
 }
 
 /* Build directory distribution object from search results (top-level dir → count). */
-static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result_t *sr,
-                                              int sr_count) {
-    yyjson_mut_val *dirs = yyjson_mut_obj(doc);
-    char dir_names[CBM_SZ_64][CBM_SZ_128];
-    int dir_counts[CBM_SZ_64];
+/* Aggregate hits by top-level directory. Shared by the JSON object and the
+ * TOON table emission. Returns the number of distinct directories. */
+static int aggregate_search_dirs(search_result_t *sr, int sr_count, char dir_names[][CBM_SZ_128],
+                                 int *dir_counts, int max_dirs) {
     int dir_n = 0;
     for (int di = 0; di < sr_count; di++) {
         char top[CBM_SZ_128] = "";
@@ -5281,18 +5680,118 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
         }
         if (found >= 0) {
             dir_counts[found]++;
-        } else if (dir_n < CBM_SZ_64) {
-            snprintf(dir_names[dir_n], sizeof(dir_names[0]), "%s", top);
+        } else if (dir_n < max_dirs) {
+            snprintf(dir_names[dir_n], CBM_SZ_128, "%s", top);
             dir_counts[dir_n] = SKIP_ONE;
             dir_n++;
         }
     }
+    return dir_n;
+}
+
+static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result_t *sr,
+                                              int sr_count) {
+    yyjson_mut_val *dirs = yyjson_mut_obj(doc);
+    char dir_names[CBM_SZ_64][CBM_SZ_128];
+    int dir_counts[CBM_SZ_64];
+    int dir_n = aggregate_search_dirs(sr, sr_count, dir_names, dir_counts, CBM_SZ_64);
     for (int d = 0; d < dir_n; d++) {
         yyjson_mut_val *key = yyjson_mut_strcpy(doc, dir_names[d]);
         yyjson_mut_val *val = yyjson_mut_int(doc, dir_counts[d]);
         yyjson_mut_obj_add(dirs, key, val);
     }
     return dirs;
+}
+
+/* TOON emission for compact-mode search results: one row per hit
+ * (qn/label/file/lines/matches/degrees — `node` dropped, it duplicates the
+ * qn's last segment), a raw[] table for uncorrelated matches, a dirs[]
+ * distribution table, and the summary scalars. */
+static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep_match_t *raw,
+                                         int raw_count, int gm_count, int limit,
+                                         bool warn_literal_pipe, uint64_t elapsed_ms) {
+    enum { MAX_RAW = 20, SEARCH_SLOW_MS = 5000 };
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+
+    int output_count = sr_count < limit ? sr_count : limit;
+    static const char *const cols[] = {"qn", "label", "file", "lines", "matches", "in", "out"};
+    cbm_toon_table_header(&sb, "results", output_count, cols, 7);
+    for (int ri = 0; ri < output_count; ri++) {
+        search_result_t *r = &sr[ri];
+        char lines[CBM_SZ_32];
+        if (r->start_line > 0) {
+            snprintf(lines, sizeof(lines), "%d-%d", r->start_line,
+                     r->end_line > r->start_line ? r->end_line : r->start_line);
+        } else {
+            lines[0] = '\0';
+        }
+        /* match line numbers ';'-joined (no comma → no cell quoting) */
+        char matches[CBM_SZ_256];
+        size_t mpos = 0;
+        matches[0] = '\0';
+        for (int j = 0; j < r->match_count && mpos + 12 < sizeof(matches); j++) {
+            int n = snprintf(matches + mpos, sizeof(matches) - mpos, "%s%d", j > 0 ? ";" : "",
+                             r->match_lines[j]);
+            if (n < 0) {
+                break;
+            }
+            mpos += (size_t)n;
+        }
+        cbm_toon_row_begin(&sb);
+        cbm_toon_cell_str(&sb, r->qualified_name, true);
+        cbm_toon_cell_str(&sb, r->label, false);
+        cbm_toon_cell_str(&sb, r->file, false);
+        cbm_toon_cell_str(&sb, lines, false);
+        cbm_toon_cell_str(&sb, matches, false);
+        cbm_toon_cell_int(&sb, r->in_degree, false);
+        cbm_toon_cell_int(&sb, r->out_degree, false);
+        cbm_toon_row_end(&sb);
+    }
+
+    int raw_output = raw_count < MAX_RAW ? raw_count : MAX_RAW;
+    if (raw_output > 0) {
+        static const char *const rcols[] = {"file", "line", "content"};
+        cbm_toon_table_header(&sb, "raw", raw_output, rcols, 3);
+        for (int ri = 0; ri < raw_output; ri++) {
+            cbm_toon_row_begin(&sb);
+            cbm_toon_cell_str(&sb, raw[ri].file, true);
+            cbm_toon_cell_int(&sb, raw[ri].line, false);
+            cbm_toon_cell_str(&sb, raw[ri].content, false);
+            cbm_toon_row_end(&sb);
+        }
+    }
+
+    char dir_names[CBM_SZ_64][CBM_SZ_128];
+    int dir_counts[CBM_SZ_64];
+    int dir_n = aggregate_search_dirs(sr, sr_count, dir_names, dir_counts, CBM_SZ_64);
+    if (dir_n > 0) {
+        static const char *const dcols[] = {"dir", "hits"};
+        cbm_toon_table_header(&sb, "dirs", dir_n, dcols, 2);
+        for (int d = 0; d < dir_n; d++) {
+            cbm_toon_row_begin(&sb);
+            cbm_toon_cell_str(&sb, dir_names[d], true);
+            cbm_toon_cell_int(&sb, dir_counts[d], false);
+            cbm_toon_row_end(&sb);
+        }
+    }
+
+    cbm_toon_scalar_int(&sb, "total_grep_matches", gm_count);
+    cbm_toon_scalar_int(&sb, "total_results", sr_count);
+    cbm_toon_scalar_int(&sb, "raw_match_count", raw_count);
+    cbm_toon_scalar_int(&sb, "elapsed_ms", (long long)elapsed_ms);
+    if (warn_literal_pipe) {
+        cbm_toon_scalar_str(&sb, "warning",
+                            "pattern contains '|' but regex=false, so it is matched literally "
+                            "(not as alternation). Pass regex=true for 'foo|bar' to mean "
+                            "'foo OR bar'.");
+    }
+    if (elapsed_ms >= SEARCH_SLOW_MS) {
+        cbm_toon_scalar_str(&sb, "warning_slow",
+                            "search was slow; narrow file_pattern/path_filter or use a more "
+                            "specific pattern");
+    }
+    return cbm_sb_finish(&sb);
 }
 
 /* Phase 4: assemble JSON output from search results */
@@ -5955,9 +6454,25 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
-    char *result =
-        assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
-                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
+    /* compact mode (default) emits TOON tables; format:"json" restores the
+     * legacy per-hit objects. full/files keep their JSON shapes (full is
+     * source-block-heavy; files is already minimal). */
+    char *sc_format = cbm_mcp_get_string_arg(args, "format");
+    bool sc_legacy_json = sc_format && strcmp(sc_format, "json") == 0;
+    free(sc_format);
+
+    char *result = NULL;
+    if (mode == 0 && !sc_legacy_json) {
+        char *toon_text =
+            assemble_search_output_toon(sr, sr_count, raw, raw_count, gm_count, limit,
+                                        pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
+        result = cbm_mcp_text_result(toon_text ? toon_text : "out of memory", toon_text == NULL);
+        free(toon_text);
+    } else {
+        result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
+                                        context_lines, root_path, pat_has_pipe && !use_regex,
+                                        cbm_now_ms() - search_t0);
+    }
     free(gm);
     free(sr);
     free(raw);

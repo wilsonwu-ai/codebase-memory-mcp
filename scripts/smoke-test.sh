@@ -187,7 +187,9 @@ echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 if ! TRACE=$(cli trace_path --project "$PROJECT" --function-name compute --direction inbound --depth 1); then
   echo "FAIL: trace_path (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-CALLERS=$(echo "$TRACE" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('callers',[])))" 2>/dev/null || echo "0")
+# trace_path default output is TOON: the callers[N]{...} header carries the count
+CALLERS=$(echo "$TRACE" | sed -n 's/^callers\[\([0-9]*\)\].*/\1/p' | head -1)
+CALLERS=${CALLERS:-0}
 if [ "$CALLERS" -lt 1 ]; then
   echo "FAIL: trace_path found 0 callers for 'compute'"
   exit 1
@@ -220,7 +222,8 @@ echo "OK: $FOLDER_COUNT Folder nodes (init.py didn't clobber them)"
 # 3d-cypher: query_graph Cypher capabilities
 # #238 WITH DISTINCT — all functions share label "Function" → collapses to 1 row.
 CYPHER_WD=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WITH DISTINCT f.label AS lbl RETURN lbl")
-WD_ROWS=$(echo "$CYPHER_WD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+WD_ROWS=$(echo "$CYPHER_WD" | sed -n 's/^total: //p' | head -1)
+WD_ROWS=${WD_ROWS:-0}
 if [ "$WD_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WITH DISTINCT returned 0 rows"
   echo "$CYPHER_WD"
@@ -230,7 +233,8 @@ echo "OK: query_graph WITH DISTINCT returned $WD_ROWS row(s)"
 
 # #241 WHERE label test — f:Function is true for every Function node.
 CYPHER_LBL=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE f:Function RETURN f.name")
-LBL_ROWS=$(echo "$CYPHER_LBL" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+LBL_ROWS=$(echo "$CYPHER_LBL" | sed -n 's/^total: //p' | head -1)
+LBL_ROWS=${LBL_ROWS:-0}
 if [ "$LBL_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WHERE label-test returned 0 rows"
   echo "$CYPHER_LBL"
@@ -240,7 +244,8 @@ echo "OK: query_graph WHERE f:Function returned $LBL_ROWS row(s)"
 
 # #242 label alternation — (n:Function|Module) seeds either label.
 CYPHER_ALT=$(cli query_graph --project "$PROJECT" --query "MATCH (n:Function|Module) RETURN n.name")
-ALT_ROWS=$(echo "$CYPHER_ALT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+ALT_ROWS=$(echo "$CYPHER_ALT" | sed -n 's/^total: //p' | head -1)
+ALT_ROWS=${ALT_ROWS:-0}
 if [ "$ALT_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph label alternation returned 0 rows"
   echo "$CYPHER_ALT"
@@ -250,7 +255,8 @@ echo "OK: query_graph (n:Function|Module) returned $ALT_ROWS row(s)"
 
 # #239 count(DISTINCT) — must parse and return a single aggregate row.
 CYPHER_CD=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) RETURN count(DISTINCT f.label)")
-CD_ROWS=$(echo "$CYPHER_CD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+CD_ROWS=$(echo "$CYPHER_CD" | sed -n 's/^total: //p' | head -1)
+CD_ROWS=${CD_ROWS:-0}
 if [ "$CD_ROWS" -ne 1 ]; then
   echo "FAIL: query_graph count(DISTINCT) expected 1 row, got $CD_ROWS"
   echo "$CYPHER_CD"
@@ -264,7 +270,7 @@ cyp_first_cell() {
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
   # metacharacters {}|=~<>" need no JSON escaping.
   cli query_graph --project "$PROJECT" --query "$1" |
-    python3 -c "import json,sys; d=json.loads(sys.stdin.read()); rows=d.get('rows',[]); print(rows[0][0] if rows and rows[0] else '')" 2>/dev/null || echo ""
+    sed -n '/^rows\[/{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -319,7 +325,8 @@ echo "OK: query_graph coalesce(f.nonesuch, f.name) = $COALV"
 
 # EXISTS { } pattern predicate (edge-type-specific existence)
 CYPHER_EX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } RETURN f.name")
-EX_ROWS=$(echo "$CYPHER_EX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+EX_ROWS=$(echo "$CYPHER_EX" | sed -n 's/^total: //p' | head -1)
+EX_ROWS=${EX_ROWS:-0}
 if [ "$EX_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph EXISTS{} predicate returned 0 rows"; echo "$CYPHER_EX"; exit 1
 fi
@@ -327,7 +334,8 @@ echo "OK: query_graph EXISTS { (f)-[:CALLS]->() } returned $EX_ROWS row(s)"
 
 # =~ regex match in WHERE
 CYPHER_RX=$(cli query_graph --project "$PROJECT" --query 'MATCH (f:Function) WHERE f.name =~ ".+" RETURN f.name')
-RX_ROWS=$(echo "$CYPHER_RX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+RX_ROWS=$(echo "$CYPHER_RX" | sed -n 's/^total: //p' | head -1)
+RX_ROWS=${RX_ROWS:-0}
 if [ "$RX_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WHERE =~ regex returned 0 rows"; echo "$CYPHER_RX"; exit 1
 fi
@@ -350,7 +358,7 @@ LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
 
 # NOT EXISTS dead-code query (functions with no caller)
 CYPHER_NX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name")
-NX_OK=$(echo "$CYPHER_NX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('rows' in d)" 2>/dev/null || echo "False")
+NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows\[[0-9]+\]\{' && echo "True" || echo "False")
 [ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
 
 # CASE expression in RETURN
@@ -373,7 +381,9 @@ esac
 if ! ARCH=$(cli get_architecture --project "$PROJECT" --aspects clusters); then
   echo "FAIL: get_architecture (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-NCLUST=$(echo "$ARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('clusters',[])))" 2>/dev/null || echo "0")
+# get_architecture default output is TOON: clusters[N]{...} header carries the count
+NCLUST=$(echo "$ARCH" | sed -n 's/^clusters\[\([0-9]*\)\].*/\1/p' | head -1)
+NCLUST=${NCLUST:-0}
 if [ "$NCLUST" -lt 1 ]; then
   echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
 fi
@@ -381,11 +391,23 @@ echo "OK: get_architecture returned $NCLUST community cluster(s)"
 
 # 3g: search_code — basic search reports elapsed_ms + matches
 SC=$(cli search_code --project "$PROJECT" --pattern cbm_ --mode compact --limit 5)
-echo "$SC" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); assert 'elapsed_ms' in d; print('OK: search_code elapsed_ms='+str(d['elapsed_ms'])+' total_grep_matches='+str(d.get('total_grep_matches')))" 2>/dev/null || { echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1; }
+# compact mode emits TOON scalars: `elapsed_ms: N` + `total_grep_matches: N`
+SC_ELAPSED=$(echo "$SC" | sed -n 's/^elapsed_ms: //p' | head -1)
+SC_GREPM=$(echo "$SC" | sed -n 's/^total_grep_matches: //p' | head -1)
+if [ -n "$SC_ELAPSED" ]; then
+  echo "OK: search_code elapsed_ms=$SC_ELAPSED total_grep_matches=${SC_GREPM:-0}"
+else
+  echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1
+fi
 
 # 3g: search_code — literal '|' under regex=false must surface a warning (#282)
 SCW=$(cli search_code --project "$PROJECT" --pattern "cbm_init|cbm_nope" --regex false --limit 5)
-echo "$SCW" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); w=' '.join(d.get('warnings',[])); assert 'regex=true' in w; print('OK: search_code literal-| warning surfaced')" 2>/dev/null || { echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1; }
+# TOON scalar `warning: ... regex=true ...`
+if echo "$SCW" | grep -q "regex=true"; then
+  echo "OK: search_code literal-| warning surfaced"
+else
+  echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1
+fi
 
 # 3g: search_code — '&' in file_pattern accepted, not rejected as invalid (#272)
 SCA=$(cli search_code --project "$PROJECT" --pattern cbm_ --file-pattern "*R&D*.c" --limit 5)

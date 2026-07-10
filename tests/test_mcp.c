@@ -799,6 +799,49 @@ TEST(tool_search_graph_includes_node_properties) {
     PASS();
 }
 
+TEST(tool_output_byte_budgets) {
+    /* GUARD: absolute byte ceilings on default tool outputs. Re-bloat (e.g.
+     * a property blob sneaking back into row emission — the fp field alone
+     * is ~450B/hit) blows these ceilings immediately. The numbers are
+     * generous vs the measured compact outputs (search hit rows ≈ 90B) but
+     * far below the legacy verbose sizes (≈1.5KB/hit). */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* search_graph: 1-hit search must stay under 600B. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest")); /* non-vacuous: hit present */
+    ASSERT_LT((int)strlen(inner), 600);
+    free(inner);
+    free(resp);
+
+    /* trace_path: single-hop trace on the fixture must stay under 800B. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":47,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+             "\"direction\":\"both\",\"depth\":2}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callees["));
+    ASSERT_LT((int)strlen(inner), 800);
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(tool_search_graph_toon_never_leaks_internal_fields) {
     /* The similarity/semantic pipeline intermediates (fp minhash hex, sp
      * structural profile, bt body-token bag) dominated the legacy payload
@@ -1135,9 +1178,10 @@ TEST(tool_trace_call_path_depth_clamped) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
 
-    /* Reached within the ceiling (proves the traversal ran) but clamped at 15. */
-    ASSERT_NOT_NULL(strstr(inner, "\"n15\""));
-    ASSERT_NULL(strstr(inner, "\"n16\""));
+    /* Reached within the ceiling (proves the traversal ran) but clamped at 15.
+     * TOON rows carry bare QNs, so match the names unquoted. */
+    ASSERT_NOT_NULL(strstr(inner, "n15"));
+    ASSERT_NULL(strstr(inner, "n16"));
 
     free(inner);
     free(resp);
@@ -1359,7 +1403,7 @@ TEST(tool_get_architecture_emits_populated_sections) {
      * those existed before #281. The "entry_points" array only appears
      * when cbm_store_get_architecture is actually called and its result
      * is serialized — which is exactly what #281 wires up. */
-    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points["));
     ASSERT_NOT_NULL(strstr(inner, "main"));
 
     free(inner);
@@ -1412,8 +1456,8 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     ASSERT_NOT_NULL(resp_all);
     char *inner_all = extract_text_content(resp_all);
     ASSERT_NOT_NULL(inner_all);
-    ASSERT_NOT_NULL(strstr(inner_all, "\"entry_points\""));
-    ASSERT_NOT_NULL(strstr(inner_all, "\"file_tree\""));
+    ASSERT_NOT_NULL(strstr(inner_all, "entry_points["));
+    ASSERT_NOT_NULL(strstr(inner_all, "file_tree["));
     free(inner_all);
     free(resp_all);
 
@@ -1426,9 +1470,9 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"node_labels\""));
-    ASSERT_NULL(strstr(inner, "\"file_tree\""));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points["));
+    ASSERT_NOT_NULL(strstr(inner, "node_labels["));
+    ASSERT_NULL(strstr(inner, "file_tree["));
 
     free(inner);
     free(resp);
@@ -1509,7 +1553,7 @@ TEST(tool_get_architecture_accepts_project_name_alias_issue640) {
     /* RED before the alias: inner is the "project not found" error.
      * GREEN after: the alias resolves and architecture sections surface. */
     ASSERT_NULL(strstr(inner, "project not found"));
-    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points["));
 
     free(inner);
     free(resp);
@@ -1617,18 +1661,23 @@ TEST(tool_get_architecture_path_scoping) {
 
     ASSERT_NOT_NULL(strstr(inner_scoped, "root_total_nodes"));
     ASSERT_NOT_NULL(strstr(inner_scoped, "scoped_total_nodes"));
-    ASSERT_NOT_NULL(strstr(inner_scoped, "\"path\""));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "path: "));
     ASSERT_NOT_NULL(strstr(inner_scoped, "hoa"));
     ASSERT_NULL(strstr(inner_scoped, "Django"));
 
     int root_nodes = 0;
     int scoped_nodes = 0;
-    const char *rt = strstr(inner_scoped, "\"root_total_nodes\":");
-    const char *stn = strstr(inner_scoped, "\"scoped_total_nodes\":");
+    /* TOON scalar form (`key: N`) with JSON fallback for format:"json". */
+    const char *rt = strstr(inner_scoped, "root_total_nodes: ");
+    const char *stn = strstr(inner_scoped, "scoped_total_nodes: ");
     if (rt) {
+        sscanf(rt, "root_total_nodes: %d", &root_nodes);
+    } else if ((rt = strstr(inner_scoped, "\"root_total_nodes\":")) != NULL) {
         sscanf(rt, "\"root_total_nodes\":%d", &root_nodes);
     }
     if (stn) {
+        sscanf(stn, "scoped_total_nodes: %d", &scoped_nodes);
+    } else if ((stn = strstr(inner_scoped, "\"scoped_total_nodes\":")) != NULL) {
         sscanf(stn, "\"scoped_total_nodes\":%d", &scoped_nodes);
     }
     ASSERT_TRUE(root_nodes > scoped_nodes);
@@ -1831,6 +1880,9 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_TRUE(grep_matches > 0);
 
@@ -1904,6 +1956,9 @@ TEST(search_code_scoped_path_with_cjk_root_issue903) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_TRUE(grep_matches > 0);
 
@@ -2022,6 +2077,9 @@ TEST(search_code_path_filter_prefilter_keeps_matches) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_EQ(grep_matches, 1);
 
@@ -2060,12 +2118,17 @@ TEST(search_code_path_filter_matches_nothing) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_EQ(grep_matches, 0);
     int results = -1;
     const char *r = strstr(inner, "\"total_results\":");
     if (r) {
         sscanf(r, "\"total_results\":%d", &results);
+    } else if ((r = strstr(inner, "total_results: ")) != NULL) {
+        sscanf(r, "total_results: %d", &results);
     }
     ASSERT_EQ(results, 0);
     ASSERT_TRUE(strstr(inner, "handler.go") == NULL);
@@ -2124,7 +2187,7 @@ TEST(search_code_literal_pipe_warns_issue282) {
                                    "\"arguments\":{\"pattern\":\"HandleRequest|Nope\","
                                    "\"regex\":false,\"project\":\"test-project\"}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "warnings"));   /* surfaced, not silent */
+    ASSERT_NOT_NULL(strstr(resp, "warning"));    /* surfaced, not silent */
     ASSERT_NOT_NULL(strstr(resp, "regex=true")); /* the hint names the fix */
     ASSERT_NOT_NULL(strstr(resp, "elapsed_ms")); /* timing is reported */
     free(resp);
@@ -3016,9 +3079,11 @@ TEST(snippet_exact_qn) {
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     /* Exact match should NOT have match_method */
     ASSERT_NULL(strstr(resp, "\"match_method\""));
-    /* Enriched properties */
-    ASSERT_NOT_NULL(strstr(resp, "\"signature\":\"func HandleRequest() error\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"return_type\":\"error\""));
+    /* No property-blob spill: the source IS the payload (signature and
+     * docstring are literally in it); metrics live behind search_graph
+     * fields=[...]. */
+    ASSERT_NULL(strstr(resp, "\"signature\""));
+    ASSERT_NULL(strstr(resp, "\"return_type\""));
     /* Caller/callee counts: 0 callers, 2 callees */
     ASSERT_NOT_NULL(strstr(resp, "\"callers\":0"));
     ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
@@ -3160,6 +3225,11 @@ TEST(snippet_fuzzy_suggestions) {
 /* ── TestSnippet_EnrichedProperties ───────────────────────────── */
 
 TEST(snippet_enriched_properties) {
+    /* GUARD (inverted since the compact-output change): the snippet response
+     * carries the verbatim source plus location/degree/coverage metadata and
+     * NOTHING from the node's property blob — no signature/return_type/
+     * is_exported duplication, and never the fp/sp/bt similarity internals
+     * (41% of the legacy response). */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -3168,9 +3238,12 @@ TEST(snippet_enriched_properties) {
         call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
                           "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"signature\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"return_type\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"is_exported\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NULL(strstr(resp, "\"signature\""));
+    ASSERT_NULL(strstr(resp, "\"return_type\""));
+    ASSERT_NULL(strstr(resp, "\"is_exported\""));
+    ASSERT_NULL(strstr(resp, "\"fp\""));
+    ASSERT_NULL(strstr(resp, "\"bt\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -5342,6 +5415,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
+    RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);

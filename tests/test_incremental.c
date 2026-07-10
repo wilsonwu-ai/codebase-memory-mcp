@@ -938,6 +938,10 @@ static int resp_has_key(const char *resp, const char *key) {
         return 1;
     /* TOON scalar form (`key: value`), the search_graph default output. */
     snprintf(pattern, sizeof(pattern), "%s: ", key);
+    if (strstr(resp, pattern) != NULL)
+        return 1;
+    /* TOON table-header form (`key[N]{...}:`), used by trace_path. */
+    snprintf(pattern, sizeof(pattern), "%s[", key);
     return strstr(resp, pattern) != NULL;
 }
 
