@@ -714,6 +714,28 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #endif /* _WIN32 */
 
+/* rename() with overwrite semantics on every platform: POSIX rename already
+ * replaces atomically; Windows rename fails with EEXIST when the target
+ * exists, so use MoveFileExW(MOVEFILE_REPLACE_EXISTING) there (wide paths —
+ * raw MoveFileExA would re-mangle non-ASCII cache paths). */
+int cbm_rename_replace(const char *src, const char *dst) {
+#ifdef _WIN32
+    wchar_t *wsrc = cbm_utf8_to_wide(src);
+    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    int ret = CBM_NOT_FOUND;
+    if (wsrc && wdst) {
+        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)
+                  ? 0
+                  : CBM_NOT_FOUND;
+    }
+    free(wsrc);
+    free(wdst);
+    return ret;
+#else
+    return rename(src, dst);
+#endif
+}
+
 /* Remove a SQLite database's -wal/-shm sidecars (both platforms). Any code
  * path that installs a FRESH database file at a path where a previous
  * generation lived must call this first: SQLite decides whether to replay a

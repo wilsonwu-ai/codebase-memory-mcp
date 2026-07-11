@@ -50,6 +50,9 @@ int cbm_unlink(const char *path);
  * DB file where a previous generation lived — a leftover WAL is otherwise
  * replayed on top of the new file at the next open (#897). */
 void cbm_remove_db_sidecars(const char *db_path);
+/* rename() that replaces an existing destination on every platform
+ * (Windows rename fails with EEXIST; this uses MoveFileExW there). */
+int cbm_rename_replace(const char *src, const char *dst);
 
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
