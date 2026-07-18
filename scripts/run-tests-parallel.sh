@@ -62,7 +62,7 @@ fi
 # when co-STARTED with a large wave on Apple Silicon (2s staggered vs ~230s
 # simultaneous — a local scheduler/zone quirk, not contention: job count
 # does not change it). Staggered in the tail they cost seconds.
-SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience \
+SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
     stack_overflow_a stack_overflow_b stack_overflow_c"
 is_serial() {
     case " $SERIAL_SUITES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
